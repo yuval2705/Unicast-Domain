@@ -6,18 +6,18 @@ import sys
 from enum import Enum
 import datetime
 import argparse
+from dataclasses import dataclass
 
-
+@dataclass
 class Message:
     """
     Used to parse and send messages.
     The server itself only accepts and saves bytes so the client can parse them as he likes.
     """
-    def __init__(self, username:str, date:datetime.datetime = None, body:str = ""):
-        self.username = username
-        self.date = date
-        self.body = body
-
+    username:str
+    date:datetime.datetime = None
+    body:str = ""
+    
     def __repr__(self) -> str:
         text = f"Send by: {self.username}"
         text += "\n" + ("-" * len(text)) + "\n"
@@ -39,6 +39,15 @@ class Client:
         self.username = username
         self.room_name = room_name
         self.init_client_sock(server_ip, server_port)
+        self._init_command_handler()
+
+    def _init_command_handler(self) -> None:
+        """
+        Inits the command handler dict which is resposible for handling the different commands.
+        """
+        self.command_handler = dict()
+        self.command_handler[Client_Command.EXIT] = self._close_session
+        self.command_handler[Client_Command.TRANSFER] = self._change_room
 
     def init_client_sock(self, server_ip:str, server_port:int) -> None:
         """
@@ -67,7 +76,7 @@ class Client:
         new_conn_req = New_Connection_Request(username, room_name)
         self.socket.send(new_conn_req.encode())
     
-    def _close_session(self) -> None:
+    def _close_session(self, *args) -> None:
         """
         Closes the current session with the server.
         """
@@ -76,12 +85,13 @@ class Client:
         close_req = Close_Request()
         self.socket.send(close_req.encode())
 
-    def _change_room(self, new_room:str) -> None:
+    def _change_room(self, new_room:str, *args) -> None:
         """
         Creates a new session with the current username but with a new room.
 
         @param new_room: The room name to create the new session to.
         """
+        self.room_name = new_room
         self.start_new_session(room_name=new_room)
 
     def handle_command(self, cli_input:str) -> None:
@@ -90,16 +100,16 @@ class Client:
 
         @param cli_input: The line that contains the command to be perfomed and its arguments.
         """
+        cli_input = cli_input.strip().lstrip()
         command = cli_input[len(Client.COMMAND_PREFIX):]
-        if command.startswith(Client_Command.EXIT):
-            self._close_session()
-        if command.startswith(Client_Command.TRANSFER):
-            command_args = command.split(" ")
-            if len(command_args) != 2:
-                print("Invalid arguments count!")
-            else:
-                self._change_room(command_args[1].strip().lstrip())
-
+        command_with_args = command.split(" ")
+        handler = self.command_handler.get(command_with_args[0], None)
+        if handler is None:
+            print("Command not found!")
+            return
+        # The first element is the command itself!
+        handler(*command_with_args[1:])
+    
     def send_message(self, cli_input:str) -> None:
         """
         Sends a message to the room.
@@ -152,9 +162,6 @@ class Client:
             for r in readables:
                 if r is self.socket:
                     self.handle_server_response()
-                    #message = self.socket.recv(Chat_Request.MAX_REQUEST_SIZE).decode()
-                    #if message:
-                    #   print(message + "\n")
                 else:
                     self.handle_cli_input(r.readline())
 

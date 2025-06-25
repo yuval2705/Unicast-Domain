@@ -1,5 +1,5 @@
 import socket
-from typing import List
+from typing import List, Dict, Optional
 import select
 from queue import Queue
 from chat import Request_Type, Chat_Request, Message_Request, Close_Request
@@ -8,6 +8,11 @@ import argparse
 DEFAULT_SERVER_ADDR = "0.0.0.0"
 DEFAULT_SERVER_PORT = 33333
 
+class Room_Permissions:
+    def __init__(self, close_room:bool=False, kick:bool=False, lock_room:bool=False):
+        self.close_room = close_room
+        self.kick = kick
+        self.lock_room = lock_room
 
 class User_Session:
     """
@@ -18,14 +23,30 @@ class User_Session:
         self.username = username
         self.room_name = room_name
         self.new_messages = Queue()
+        self.is_active = True
 
 
 class Room:
-    def __init__(self, name:str, members:List[str] = list(), messages:List[bytes] = list()):
+    def __init__(self, name:str, members:Dict[str, Optional[Room_Permissions]] = list(), messages:List[bytes] = list(), locked:bool=False,
+                      default_permissions:Room_Permissions=Room_Permissions()):
         self.name = name
-        self._members = members
         self.messages = messages
-        self.subscribers = list()
+
+        # All the members in the room, how can enter and whats their permissions.
+        self._members = members
+        
+        # Current active `User_Sessions`s to receive and send messages.
+        self.subscribers = list() 
+        
+        self.locked = locked
+        self.default_permissions = default_permissions
+
+    def _can_subscribe(self, user_session:User_Session) -> bool:
+        if not self.locked:
+            return True
+        if user_session.username in self._members.keys():
+            return True
+        return False
 
     def add_subscriber(self, user_session:User_Session) -> bool:
         """
@@ -35,12 +56,12 @@ class Room:
         @param user_session: The `User_Session` to subscribe.
         @return: A bool indication if the operation was succesful or not.
         """
-        if user_session.username not in self._members:
+        if not self._can_subscribe(user_session.username):
             return False
-
-        self.subscribers.append(user_session.new_messages)
-        for msg in self.messages:
-            user_session.new_messages.put(msg)
+        
+        self.subscribers.append(user_session)
+        if user_session.username not in self._members.keys():
+            self._members.update({user_session.username:self.default_permissions})
         return True
 
     def invoke_new_message(self, raw_message:bytes) -> None:
@@ -50,11 +71,14 @@ class Room:
         @param raw_message: The message to add.
         """
         self.messages.append(raw_message)
-        for q in self.subscribers:
-            try:
-                q.put(raw_message)
-            except Exception as e:
-                self.subscribers.remove(q)
+        for user_session in self.subscribers:
+            if user_session.is_active:
+                try:
+                    user_session.new_messages.put(raw_message)
+                except Exception as e:
+                    self.subscribers.remove(user_session)
+            else:
+                self.unsubscribe(user_session)
 
     def unsubscribe(self, user_session:User_Session) -> None:
         """
@@ -62,8 +86,19 @@ class Room:
 
         @param user_session: The `User_Session` to remove from the subscribers.
         """
-        if user_session.new_messages in self.subscribers:
-            self.subscribers.remove(user_session.new_messages)
+        if user_session in self.subscribers:
+            self.subscribers.remove(user_session)
+    
+    def _get_user_permissions(self, username:str) -> Optional[Room_Permissions]:
+        if username not in self._members.keys():
+            return None
+        return self._members.get(user_session.username, None)
+        
+    def close(self, user_session:User_Session) -> bool:
+        user_perms = self._get_user_permissions(user_session.username)
+        if user_perms is None:
+            return False
+        return user_perms.close_room
 
 
 class Server:
@@ -73,6 +108,7 @@ class Server:
         self.init_main_socket(ip, port)
         self.open_sockets = {self.main_socket: None}
         self.rooms = dict()
+        self._init_request_handler()
         # Tests
         self._add_test()
 
@@ -82,8 +118,8 @@ class Server:
 
         @param self: The server to add the rooms to.
         """
-        self._add_test_room("kita-alef", ["yuval", "yuval2", "yuval3"], [b"blablabla", b"blablbla2", b"blblbla3"])
-        self._add_test_room("kita-bet", ["yuval", "yuval2"], [b"cacacacacac", b"cacacacaca2", b"cacacaca3"])
+        self._add_test_room("kita-alef", {"yuval":None, "yuval2":None, "yuval3":None}, [b"blablabla", b"blablbla2", b"blblbla3"])
+        self._add_test_room("kita-bet", {"yuval":None, "yuval2":None}, [b"cacacacacac", b"cacacacaca2", b"cacacaca3"])
 
     def _add_test_room(self, room_name:str, members:List[str], messages:List[bytes]) -> None:
         """
@@ -96,6 +132,15 @@ class Server:
         """
         new_room = Room(room_name, members, messages)
         self.rooms.update({room_name : new_room})
+
+    def _init_request_handler(self) -> None:
+        """
+        Inits the request handler dict which is responsible for handling the different requests.
+        """
+        self.request_handler = dict()
+        self.request_handler[Request_Type.NEW_CONNECTION] = self._handle_new_connection
+        self.request_handler[Request_Type.MESSAGE] = self._handle_new_message
+        self.request_handler[Request_Type.EXIT] = self.close_client_connection
 
     def init_main_socket(self, ip:str, port:str) -> None:
         """
@@ -117,20 +162,20 @@ class Server:
         sock, addr = self.main_socket.accept()
         self.open_sockets.update({sock: None})
 
-    def _handle_new_connection(self, client_socket:socket.socket, request:Chat_Request) -> None:
+    def _handle_new_connection(self, client_socket:socket.socket, *request_args) -> None:
         """
         Attaches a `User_Session` according to the new "connection request" with the socket
         for later communication between the client and the server.
 
         @param client_socket: The socket which the new connection is comming from.
-        @param request: The new connection request that had been sent.
+        @param request_args: The arguments of the request that had been sent.
         """ 
         
         # If the user wants to change his room it pops the previous `User_Session` for the new one.
         self.close_user_session(self.open_sockets.get(client_socket, None))
 
         # The new `User_Session` object.
-        decoded_args = [arg.decode() for arg in request.args]
+        decoded_args = [arg.decode() for arg in request_args]
         new_session = User_Session(*decoded_args)
         self.open_sockets.update({client_socket: new_session}) 
         requested_room = self.rooms.get(new_session.room_name, None)
@@ -142,7 +187,7 @@ class Server:
         client_socket.send(close_request.encode())
         self.close_client_connection(client_socket)
 
-    def _handle_new_message(self, client_socket:socket.socket, raw_message:bytes) -> None:
+    def _handle_new_message(self, client_socket:socket.socket, raw_message:bytes, *args) -> None:
         """
         Handles and called when the client wants/sent a new message.
 
@@ -171,12 +216,12 @@ class Server:
             return
         decoded_request = Chat_Request.decode(request)
         req_type = decoded_request.type
-        if req_type == Request_Type.NEW_CONNECTION:
-            self._handle_new_connection(client_socket, decoded_request)
-        if req_type == Request_Type.MESSAGE:
-            self._handle_new_message(client_socket, decoded_request.args[0])
-        if req_type == Request_Type.EXIT:
-            self.close_client_connection(client_socket)
+
+        handler = self.request_handler.get(req_type, None)
+        if handler is None:
+            return
+
+        handler(client_socket, *decoded_request.args)
     
     def close_user_session(self, user_session:User_Session) -> None:
         """
@@ -190,7 +235,7 @@ class Server:
             if requested_room:
                 requested_room.unsubscribe(user_session)
 
-    def close_client_connection(self, client_socket:socket.socket) -> None:
+    def close_client_connection(self, client_socket:socket.socket, *args) -> None:
         """
         Closes the connection between this client and the server.
         It is being called everytime we want to `terminate` or stop the communication socket itself.
