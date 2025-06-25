@@ -2,29 +2,12 @@ import socket
 from typing import List, Dict, Optional
 import select
 from queue import Queue
+from permissions import Room_Permissions, Server_Permissions, Admin_Server_Permissions, Permissions_Exception
 from chat import Request_Type, Chat_Request, Message_Request, Close_Request
 import argparse
 
 DEFAULT_SERVER_ADDR = "0.0.0.0"
 DEFAULT_SERVER_PORT = 33333
-
-class Room_Permissions:
-    def __init__(self, close_room:bool=False, kick:bool=False, lock_room:bool=False):
-        self.close_room = close_room
-        self.kick = kick
-        self.lock_room = lock_room
-
-class Server_Permissions:
-    def __init__(self, shutdown:bool=False, whisper:bool=True, multicast:bool=True):
-        self.shutdown = shutdown
-        self.whisper = whisper
-        self.mulitcast = multicast
-
-
-class Admin_Server_Permissions(Server_Permissions):
-    def __init__(self, shutdown:bool=True, whisper:bool=True, multicast:bool=True):
-        super().__init__(shutdown=shutdown, whisper=whisper, multicast=multicast)
-
 
 class User_Session:
     """
@@ -119,25 +102,23 @@ class Room:
         return user_perms
 
     def lock(self, user_session:User_Session) -> bool:
-        user_perms = self._get_user_permissions(user_session.username)
-        if user_perms is None:
-            return False
-        if user_perms.lock_room:
-            self.locked = not self.locked
+        user_perms = self._get_user_permissions(user_session.username) 
+        if not user_perms.lock_room:
+            raise Permissions_Exception(f"You dont have permissions to lock {self.name}")
+        self.locked = not self.locked
         return True
 
-    def close(self, user_session:User_Session) -> bool:
+    def close(self, user_session:User_Session):
         user_perms = self._get_user_permissions(user_session.username)
-        if user_perms is None:
-            return False
-        return user_perms.close_room
+        if not user_perms.close_room:
+            raise Permissions_Exception(f"You dont have permissions to close {self.name}")
+        return
 
     def fill_history(self, user_session:User_Session) -> bool:
         if not self._can_subscribe(user_session):
-            return False
+            raise Permissions_Exception(f"You dont have permissions to get history of {self.name}")
         for raw_message in self.messages:
             user_session.new_messages.put(raw_message)
-        return True
     
     def kick(self, user_session:User_Session, username:str) -> List[User_Session]:
         sessions_kicked = []
@@ -356,11 +337,11 @@ class Server:
         if not requested_room:
             # need to make it throw exception!
             pass
-        if requested_room.close(user_session):
-            for user_session in requested_room.subscribers:
-                self.open_sockets.pop(user_session.client_socket)
-                user_session.close_connection(raw_message)
-            self.rooms.pop(requested_room.name)
+        requested_room.close(user_session):
+        for user_session in requested_room.subscribers:
+            self.open_sockets.pop(user_session.client_socket)
+            user_session.close_connection(raw_message)
+        self.rooms.pop(requested_room.name)
 
 
     def handle_user_request(self, client_socket:socket.socket) -> None:
@@ -379,8 +360,12 @@ class Server:
         handler = self.request_handler.get(req_type, None)
         if handler is None:
             return
-
-        handler(client_socket, *decoded_request.args)
+        try:
+            handler(client_socket, *decoded_request.args)
+        except Permissions_Exception as e:
+            self.open_sockets.pop(user_session.client_socket)
+            user_session.close_connection((f"Permission Error! {str(e)}".encode())
+            
 
     def close_user_session(self, user_session:User_Session) -> None:
         """
