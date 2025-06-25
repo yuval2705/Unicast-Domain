@@ -3,6 +3,13 @@ from enum import Enum
 class Request_Type(bytes, Enum):
     NEW_CONNECTION = b'\x00'
     MESSAGE = b'\x01'
+    KICK = b'\x02'
+    CLOSE_ROOM = b'\x03'
+    LOCK_ROOM = b'\x04'
+    LIST_ROOM = b'\x05'
+    HISTORY = b'\x06'
+    UNICAST = b'\xFD'
+    SHUTDOWN = b'\xFE'
     EXIT = b'\xFF'
 
 
@@ -52,3 +59,33 @@ class Message_Request(Chat_Request):
 class Close_Request(Chat_Request):
     def __init__(self, close_message:bytes=b""):
         super().__init__(Request_Type.EXIT, close_message)
+
+
+class Shutdown_Request(Chat_Request):
+    def __init__(self, close_message:bytes=b""):
+        super().__init__(Request_Type.SHUTDOWN, close_message)
+
+
+class Kick_Request(Chat_Request):
+    def __init__(self, username_to_kick:bytes, kick_message:bytes=b""):
+        super().__init__(Request_Type.KICK, username_to_kick, kick_message)
+
+
+class Lock_Room_Request(Chat_Request):
+    def __init__(self, room:str):
+        super().__init__(Request_Type.LOCK_ROOM, room.encode())
+
+
+class List_Room_Request(Chat_Request):
+    def __init__(self, room:str):
+        super().__init__(Request_Type.LOCK_ROOM, room.encode())
+
+
+class History_Request(Chat_Request):
+    def __init__(self, room:str):
+        super().__init__(Request_Type.HISTORY, room.encode())
+
+
+class Close_Room_Request(Chat_Request):
+    def __init__(self, room:str):
+        super().__init__(Request_Type.CLOSE_ROOM, room.encode())

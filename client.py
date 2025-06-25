@@ -1,12 +1,14 @@
 import socket
 from server import DEFAULT_SERVER_ADDR, DEFAULT_SERVER_PORT
-from chat import Chat_Request, Message_Request, Request_Type, Close_Request, New_Connection_Request
+from chat import Chat_Request, Message_Request, Request_Type, Close_Request, New_Connection_Request, Lock_Room_Request, \
+                History_Request, Shutdown_Request, Kick_Request, Close_Room_Request, List_Room_Request
 import select
 import sys
 from enum import Enum
 import datetime
 import argparse
 from dataclasses import dataclass
+from typing import List, Optional, Union, Dict
 
 @dataclass
 class Message:
@@ -31,6 +33,12 @@ class Client_Command(str, Enum):
     """
     EXIT = "exit"
     TRANSFER = "transfer"
+    LOCK_ROOM = "lock-room"
+    KICK = "kick"
+    LIST_ROOM = "list-room"
+    CLOSE_ROOM = "close-room"
+    HISTORY = "history"
+    SHUTDOWN = "shutdown"
 
 
 class Client:
@@ -48,6 +56,12 @@ class Client:
         self.command_handler = dict()
         self.command_handler[Client_Command.EXIT] = self._close_session
         self.command_handler[Client_Command.TRANSFER] = self._change_room
+        self.command_handler[Client_Command.LOCK_ROOM] = self._lock_room
+        self.command_handler[Client_Command.HISTORY] = self._get_room_history
+        self.command_handler[Client_Command.SHUTDOWN] = self._shutdown_server
+        self.command_handler[Client_Command.LIST_ROOM] = self._list_room
+        self.command_handler[Client_Command.CLOSE_ROOM] = self._close_room
+        self.command_handler[Client_Command.KICK] = self._kick_user
 
     def init_client_sock(self, server_ip:str, server_port:int) -> None:
         """
@@ -60,20 +74,12 @@ class Client:
         self.socket.connect((server_ip, server_port))
         self.in_session = True
 
-    def start_new_session(self, username:str=None, room_name:str=None) -> None:
+    def start_new_session(self) -> None:
         """
         Sends to the server that a new session is starting and send him the relevent information for the session.
         (like username and room_name).
-
-        @param username: The username for the new session.
-        @param room_name: The room to connect to in this new session.
         """
-        if username is None:
-            username = self.username
-        if room_name is None:
-            room_name = self.room_name
-
-        new_conn_req = New_Connection_Request(username, room_name)
+        new_conn_req = New_Connection_Request(self.username, self.room_name)
         self.socket.send(new_conn_req.encode())
     
     def _close_session(self, *args) -> None:
@@ -92,8 +98,55 @@ class Client:
         @param new_room: The room name to create the new session to.
         """
         self.room_name = new_room
-        self.start_new_session(room_name=new_room)
+        self.start_new_session()
+    
+    def _shutdown_server(self, message:str="", *args) -> None:
+        """
+        Sends a shutdown request to the server.
+        If permission are meet it will indeed Shutdown the server with the given message.
 
+        @param message: The message to send to everyone when the server shuts down.
+        """
+        shutdown_req = Shutdown_Request(message.encode())
+        self.socket.send(shutdown_req.encode())
+
+    def _lock_room(self, room_to_lock:Optional[str]=None, *args) -> None:
+        if not room_to_lock:
+            room_to_lock = self.room_name
+        lock_req = Lock_Room_Request(room_to_lock)
+        self.socket.send(lock_req.encode())
+    
+    def _get_room_history(self, target_room:Optional[str]=None, *args) -> None:
+        if not target_room:
+            target_room = self.room_name
+        history_req = History_Request(target_room)
+        self.socket.send(history_req.encode())
+
+    def _close_room(self, room_to_close:Optional[str]=None, *args) -> None:
+        if not room_to_close:
+            room_to_close = self.room_name
+        close_room_req = Close_Room_Request(room_to_close)
+        self.socket.send(close_room_req.encode())
+    
+    def _list_room(self, room_to_list:Optional[str]=None, *args) -> None:
+        if not room_to_list:
+            room_to_list = self.room_name
+        list_room_req = List_Room_Request(room_to_list)
+        self.socket.send(list_room_req.encode())
+    
+    def _kick_user(self, username:str, *message_parts) -> None:
+        """
+        Sends a shutdown request to the server.
+        If permission are meet it will indeed Shutdown the server with the given message.
+
+        @param message: The message to send to everyone when the server shuts down.
+        """
+        message = " ".join(message_parts)
+        encoded_username = username.encode()
+        kick_req = Kick_Request(encoded_username, message.encode())
+        self.socket.send(kick_req.encode())
+
+    
     def handle_command(self, cli_input:str) -> None:
         """
         Calls to the relevent functions to perfom the command.

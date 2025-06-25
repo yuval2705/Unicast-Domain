@@ -14,21 +14,42 @@ class Room_Permissions:
         self.kick = kick
         self.lock_room = lock_room
 
+class Server_Permissions:
+    def __init__(self, shutdown:bool=False, whisper:bool=True, multicast:bool=True):
+        self.shutdown = shutdown
+        self.whisper = whisper
+        self.mulitcast = multicast
+
+
+class Admin_Server_Permissions(Server_Permissions):
+    def __init__(self, shutdown:bool=True, whisper:bool=True, multicast:bool=True):
+        super().__init__(shutdown=shutdown, whisper=whisper, multicast=multicast)
+
+
 class User_Session:
     """
     Holds additional information about the user session so that the server would know
     what each socket needs to get and to where he needs to send.
     """
-    def __init__(self, username:str = None, room_name:str = None):
+    def __init__(self, client_socket:socket.socket, username:str = None, room_name:str = None,
+                    permissions:Server_Permissions=Server_Permissions()):
         self.username = username
         self.room_name = room_name
         self.new_messages = Queue()
+        self.client_socket = client_socket
+        self.permissions = permissions
         self.is_active = True
+    
+    def close_connection(self, raw_message:bytes):
+        self.is_active = False
+        close_request = Close_Request(raw_message)
+        self.client_socket.send(close_request.encode()) 
+        self.client_socket.close()
 
 
 class Room:
-    def __init__(self, name:str, members:Dict[str, Optional[Room_Permissions]] = list(), messages:List[bytes] = list(), locked:bool=False,
-                      default_permissions:Room_Permissions=Room_Permissions()):
+    def __init__(self, name:str, members:Dict[str, Optional[Room_Permissions]] = list(), messages:List[bytes] = list(),
+                    locked:bool=False, default_permissions:Room_Permissions=Room_Permissions()):
         self.name = name
         self.messages = messages
 
@@ -56,7 +77,7 @@ class Room:
         @param user_session: The `User_Session` to subscribe.
         @return: A bool indication if the operation was succesful or not.
         """
-        if not self._can_subscribe(user_session.username):
+        if not self._can_subscribe(user_session):
             return False
         
         self.subscribers.append(user_session)
@@ -92,23 +113,57 @@ class Room:
     def _get_user_permissions(self, username:str) -> Optional[Room_Permissions]:
         if username not in self._members.keys():
             return None
-        return self._members.get(user_session.username, None)
-        
+        user_perms = self._members.get(username, None)
+        if user_perms is None:
+            user_perms = self.default_permissions
+        return user_perms
+
+    def lock(self, user_session:User_Session) -> bool:
+        user_perms = self._get_user_permissions(user_session.username)
+        if user_perms is None:
+            return False
+        if user_perms.lock_room:
+            self.locked = not self.locked
+        return True
+
     def close(self, user_session:User_Session) -> bool:
         user_perms = self._get_user_permissions(user_session.username)
         if user_perms is None:
             return False
         return user_perms.close_room
 
+    def fill_history(self, user_session:User_Session) -> bool:
+        if not self._can_subscribe(user_session):
+            return False
+        for raw_message in self.messages:
+            user_session.new_messages.put(raw_message)
+        return True
+    
+    def kick(self, user_session:User_Session, username:str) -> List[User_Session]:
+        sessions_kicked = []
+        user_perms = self._get_user_permissions(user_session.username)
+        if user_perms is None:
+            return sessions_kicked
+        if not user_perms.kick:
+            return sessions_kicked
+        self._members.pop(username)
+        
+        for member_session in self.subscribers:
+            if member_session.username == username:
+                sessions_kicked.append(member_session)
+        return sessions_kicked
+        
 
 class Server:
-    def __init__(self, ip:str = DEFAULT_SERVER_ADDR, port:int = DEFAULT_SERVER_PORT, rooms:List[Room] = list()):
+    def __init__(self, ip:str = DEFAULT_SERVER_ADDR, port:int = DEFAULT_SERVER_PORT, rooms:List[Room] = list(),
+                    admins:List[str] = list()):
         self.ip = ip
         self.port = port
-        self.init_main_socket(ip, port)
-        self.open_sockets = {self.main_socket: None}
+        self.admins = admins
         self.rooms = dict()
         self._init_request_handler()
+        self.init_main_socket(ip, port)
+        self.open_sockets = {self.main_socket: None}
         # Tests
         self._add_test()
 
@@ -118,8 +173,9 @@ class Server:
 
         @param self: The server to add the rooms to.
         """
-        self._add_test_room("kita-alef", {"yuval":None, "yuval2":None, "yuval3":None}, [b"blablabla", b"blablbla2", b"blblbla3"])
+        self._add_test_room("kita-alef", {"yuval":Room_Permissions(True, True, True), "yuval2":None, "yuval3":None}, [b"blablabla", b"blablbla2", b"blblbla3"])
         self._add_test_room("kita-bet", {"yuval":None, "yuval2":None}, [b"cacacacacac", b"cacacacaca2", b"cacacaca3"])
+        self.admins = ["yuval"]
 
     def _add_test_room(self, room_name:str, members:List[str], messages:List[bytes]) -> None:
         """
@@ -141,6 +197,13 @@ class Server:
         self.request_handler[Request_Type.NEW_CONNECTION] = self._handle_new_connection
         self.request_handler[Request_Type.MESSAGE] = self._handle_new_message
         self.request_handler[Request_Type.EXIT] = self.close_client_connection
+        self.request_handler[Request_Type.LOCK_ROOM] = self._handle_lock_room
+        self.request_handler[Request_Type.HISTORY] = self._handle_history
+        self.request_handler[Request_Type.SHUTDOWN] = self._handle_shutdown
+        self.request_handler[Request_Type.CLOSE_ROOM] = self._handle_close_room
+        self.request_handler[Request_Type.KICK] = self._handle_kick_user
+        # self.request_handler[Request_Type.
+
 
     def init_main_socket(self, ip:str, port:str) -> None:
         """
@@ -176,7 +239,14 @@ class Server:
 
         # The new `User_Session` object.
         decoded_args = [arg.decode() for arg in request_args]
-        new_session = User_Session(*decoded_args)
+        username, room_name = decoded_args
+
+        if username in self.admins:
+            user_perms = Admin_Server_Permissions()
+        else:
+            user_perms = Server_Permissions()
+
+        new_session = User_Session(client_socket, username, room_name, user_perms)
         self.open_sockets.update({client_socket: new_session}) 
         requested_room = self.rooms.get(new_session.room_name, None)
         if requested_room:
@@ -204,6 +274,95 @@ class Server:
         if requested_room:
             requested_room.invoke_new_message(raw_message)
 
+    def _handle_kick_user(self, client_socket:socket.socket, user_to_kick:bytes,
+                            raw_kick_message:bytes=b"", *args) -> None:
+        user_session = self.open_sockets.get(client_socket, None)
+        if user_session is None:
+            # need to make it throw exception!
+            pass
+            return
+        requested_room = self.rooms.get(user_session.room_name, None)
+        if not requested_room:
+            # need to make it throw exception!
+            pass
+            return
+        kicked_users = requested_room.kick(user_session, user_to_kick.decode())
+        for user in kicked_users:
+            self.open_sockets.pop(user.client_socket)
+            user.close_connection(raw_kick_message)
+
+    def _handle_lock_room(self, client_socket:socket.socket, room_name_encoded:bytes=None, *args):
+        user_session = self.open_sockets.get(client_socket, None)
+        if user_session is None:
+            # need to make it throw exception!
+            pass
+            return
+        
+        request_room_name = user_session.room_name
+        if room_name_encoded:
+            request_room_name = room_name_encoded.decode()
+        requested_room = self.rooms.get(request_room_name, None)
+        if not requested_room:
+            # need to make it throw exception!
+            pass
+            return
+        requested_room.lock(user_session)
+
+    def _handle_history(self, client_socket:socket.socket, room_name_encoded:bytes=None, *args):
+        user_session = self.open_sockets.get(client_socket, None)
+        if user_session is None:
+            # need to make it throw exception!
+            pass
+            return
+        
+        request_room_name = user_session.room_name
+        if room_name_encoded:
+            request_room_name = room_name_encoded.decode()
+        requested_room = self.rooms.get(request_room_name, None)
+        if not requested_room:
+            # need to make it throw exception!
+            pass
+        requested_room.fill_history(user_session)
+
+    def _handle_shutdown(self, client_socket:socket.socket, raw_message:bytes=b"", *args):
+        user_session = self.open_sockets.get(client_socket, None)
+        if user_session is None:
+            # need to make it throw exception!
+            pass
+            return
+        if not user_session.permissions.shutdown:
+            # need to make it throw exception!
+            pass
+            return
+        self.open_sockets.pop(self.main_socket)
+        self.main_socket.close()
+        for sock, user_session in self.open_sockets.items():
+            user_session.close_connection(raw_message)
+        
+        self.open_sockets.clear()
+    
+    def _handle_close_room(self, client_socket:socket.socket, room_name_encoded:bytes=b"",
+                            raw_message:bytes=b"", *args):
+        user_session = self.open_sockets.get(client_socket, None)
+        if user_session is None:
+            # need to make it throw exception!
+            pass
+            return
+        
+        request_room_name = user_session.room_name
+        if room_name_encoded:
+            request_room_name = room_name_encoded.decode()
+        requested_room = self.rooms.get(request_room_name, None)
+        if not requested_room:
+            # need to make it throw exception!
+            pass
+        if requested_room.close(user_session):
+            for user_session in requested_room.subscribers:
+                self.open_sockets.pop(user_session.client_socket)
+                user_session.close_connection(raw_message)
+            self.rooms.pop(requested_room.name)
+
+
     def handle_user_request(self, client_socket:socket.socket) -> None:
         """
         Handles and called every time the client sends a request.
@@ -222,7 +381,7 @@ class Server:
             return
 
         handler(client_socket, *decoded_request.args)
-    
+
     def close_user_session(self, user_session:User_Session) -> None:
         """
         Closes a `User_Session` object.
@@ -284,7 +443,7 @@ class Server:
         Starts the server and does the main loop of the server
         """
         self.main_socket.listen()
-        while True:
+        while len(self.open_sockets) > 0:
             readable, writable, _ = select.select(self.open_sockets,self.open_sockets,[])
             for client_socket in readable:
                 if client_socket is self.main_socket:
@@ -298,10 +457,6 @@ class Server:
                 except Exception as e:
                     self._handle_exception(client_socket, e)
  
-        for sock in self.open_sockets:
-            sock.close()
-        self.main_socket.close()
-
 
 def init_argparser() -> argparse.ArgumentParser:
     """
